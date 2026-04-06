@@ -108,8 +108,9 @@ cat > "$PLIST_PATH" <<EOF
         <string>$SCRIPT_PATH</string>
     </array>
 
+    <!-- Check for new files every 2 minutes via Drive Changes API -->
     <key>StartInterval</key>
-    <integer>300</integer>
+    <integer>120</integer>
 
     <key>RunAtLoad</key>
     <true/>

@@ -3,16 +3,16 @@
 Move meeting notes (.docx) from teammates' shared 'Read AI Meeting Notes' folders
 to the correct client subfolder in the shared Clients folder, using Google Drive API.
 
-Flow:
-  1. Authenticates you (admin) via browser once — token saved locally.
-  2. Finds all 'Read AI Meeting Notes' folders shared with your account.
-  3. For each .docx file, matches the client name against folders in Clients.
-  4. Creates Team Documents/Meeting Notes under the client folder if needed.
-  5. Skips duplicates using Drive's built-in MD5 checksum (no download needed).
-  6. Moves matched files to the correct destination.
-  7. Writes a Move Log.txt back into each teammate's folder so they can see activity.
+Detection strategy:
+  - Change detection : Polls Drive Changes API every 2 min — only acts when a new
+                       .docx appears in a source folder. Near-instant response.
+  - Weekly full scan : Every 7 days, scans all source folders completely as a
+                       safety net to catch anything missed.
+
+State is stored in state.json (page token + last full scan timestamp).
 
 Config : move_meeting_notes.json
+State  : state.json (auto-managed)
 Logs   : move_meeting_notes.log (admin)  +  Move Log.txt (per teammate, in their Drive folder)
 Token  : token.json (auto-created on first run)
 Creds  : credentials.json (download from Google Cloud Console)
@@ -22,7 +22,7 @@ import io
 import json
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -36,9 +36,11 @@ CONFIG_FILE = SCRIPT_DIR / "move_meeting_notes.json"
 LOG_FILE    = SCRIPT_DIR / "move_meeting_notes.log"
 TOKEN_FILE  = SCRIPT_DIR / "token.json"
 CREDS_FILE  = SCRIPT_DIR / "credentials.json"
+STATE_FILE  = SCRIPT_DIR / "state.json"
 
-SOURCE_FOLDER_NAME = "Read AI Meeting Notes"
+SOURCE_FOLDER_NAME  = "Read AI Meeting Notes"
 DRIVE_LOG_FILENAME  = "Move Log.txt"
+FULL_SCAN_INTERVAL  = timedelta(days=7)
 LOG_HEADER = (
     f"{'TIMESTAMP':<20}  {'FILE':<50}  MOVED TO\n"
     f"{'-'*20}  {'-'*50}  {'-'*60}"
@@ -80,6 +82,25 @@ def get_service():
     return build("drive", "v3", credentials=creds)
 
 
+# ── State ─────────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"page_token": None, "last_full_scan": None}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def is_full_scan_due(state: dict) -> bool:
+    if not state.get("last_full_scan"):
+        return True
+    last = datetime.fromisoformat(state["last_full_scan"])
+    return datetime.now(timezone.utc) - last >= FULL_SCAN_INTERVAL
+
+
 # ── Drive helpers ─────────────────────────────────────────────────────────────
 
 def list_files(service, query: str, fields: str = "files(id, name, md5Checksum, parents)") -> list:
@@ -101,7 +122,6 @@ def list_files(service, query: str, fields: str = "files(id, name, md5Checksum, 
 
 
 def get_or_create_folder(service, name: str, parent_id: str) -> str:
-    """Return the folder ID for name under parent_id, creating it if needed."""
     query = (
         f"name = '{name}' "
         f"and mimeType = 'application/vnd.google-apps.folder' "
@@ -126,8 +146,7 @@ def get_or_create_folder(service, name: str, parent_id: str) -> str:
 
 
 def list_folder_children(service, folder_id: str) -> list:
-    query = f"'{folder_id}' in parents and trashed = false"
-    return list_files(service, query)
+    return list_files(service, f"'{folder_id}' in parents and trashed = false")
 
 
 def move_file(service, file_id: str, old_parent_id: str, new_parent_id: str, new_name: str) -> None:
@@ -141,10 +160,45 @@ def move_file(service, file_id: str, old_parent_id: str, new_parent_id: str, new
     ).execute()
 
 
+# ── Change detection ──────────────────────────────────────────────────────────
+
+def get_start_page_token(service) -> str:
+    resp = service.changes().getStartPageToken(
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+    ).execute()
+    return resp["startPageToken"]
+
+
+def get_changed_files(service, page_token: str) -> tuple[list[dict], str]:
+    """Return (list of changed file metadata, new page token)."""
+    changed = []
+    while True:
+        resp = service.changes().list(
+            pageToken=page_token,
+            fields=(
+                "nextPageToken, newStartPageToken, "
+                "changes(removed, fileId, file(id, name, md5Checksum, parents, mimeType, trashed))"
+            ),
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        ).execute()
+
+        for change in resp.get("changes", []):
+            f = change.get("file")
+            if f and not change.get("removed") and not f.get("trashed"):
+                changed.append(f)
+
+        page_token = resp.get("nextPageToken") or resp.get("newStartPageToken")
+        if not resp.get("nextPageToken"):
+            break
+
+    return changed, page_token
+
+
 # ── Teammate Drive log ────────────────────────────────────────────────────────
 
 def fetch_existing_drive_log(service, folder_id: str) -> tuple[str, str | None]:
-    """Return (existing_text, file_id) of Move Log.txt in folder, or ('', None)."""
     files = list_files(
         service,
         query=f"name = '{DRIVE_LOG_FILENAME}' and '{folder_id}' in parents and trashed = false",
@@ -154,9 +208,8 @@ def fetch_existing_drive_log(service, folder_id: str) -> tuple[str, str | None]:
         return "", None
 
     file_id = files[0]["id"]
-    request = service.files().get_media(fileId=file_id)
     buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
+    downloader = MediaIoBaseDownload(buf, service.files().get_media(fileId=file_id))
     done = False
     while not done:
         _, done = downloader.next_chunk()
@@ -164,14 +217,11 @@ def fetch_existing_drive_log(service, folder_id: str) -> tuple[str, str | None]:
 
 
 def append_to_drive_log(service, folder_id: str, new_rows: list[str]) -> None:
-    """Append new table rows to Move Log.txt, creating with header if it doesn't exist."""
     existing_text, file_id = fetch_existing_drive_log(service, folder_id)
 
     if existing_text.strip():
-        # File exists — append new rows below existing content
         full_text = existing_text.rstrip("\n") + "\n" + "\n".join(new_rows) + "\n"
     else:
-        # First time — write header + rows
         full_text = LOG_HEADER + "\n" + "\n".join(new_rows) + "\n"
 
     media = MediaIoBaseUpload(
@@ -190,17 +240,15 @@ def append_to_drive_log(service, folder_id: str, new_rows: list[str]) -> None:
         ).execute()
 
 
-# ── Core logic ────────────────────────────────────────────────────────────────
+# ── File processing ───────────────────────────────────────────────────────────
 
 def extract_topic(stem: str) -> str:
-    """Strip 'YYYY-MM-DD - ' prefix and return the meeting topic."""
     if len(stem) > 13 and stem[4] == "-" and stem[7] == "-" and stem[10:13] == " - ":
         return stem[13:]
     return stem
 
 
 def find_client_match(topic: str, client_map: dict[str, str]) -> tuple[str, str] | tuple[None, None]:
-    """Return (client_name, folder_id) for the best match, or (None, None)."""
     topic_lower = topic.lower()
     for name in sorted(client_map, key=len, reverse=True):
         if name.lower() in topic_lower:
@@ -209,33 +257,77 @@ def find_client_match(topic: str, client_map: dict[str, str]) -> tuple[str, str]
 
 
 def is_duplicate(source_md5: str, dest_files: list) -> bool:
-    """Return True if any file in dest_files shares the same MD5."""
     return any(f.get("md5Checksum") == source_md5 for f in dest_files)
 
+
+def process_files(
+    service,
+    files: list[dict],
+    source_folder_id: str,
+    owner: str,
+    client_map: dict[str, str],
+    dry_run: bool,
+) -> int:
+    """Process a list of .docx files from one source folder. Returns number moved."""
+    new_log_rows: list[str] = []
+    moved = 0
+
+    for file in sorted(files, key=lambda f: f["name"]):
+        name = file["name"]
+        topic = extract_topic(Path(name).stem)
+        client_name, client_folder_id = find_client_match(topic, client_map)
+
+        if client_name is None:
+            log.info("SKIP    %s  (no client match)", name)
+            continue
+
+        if dry_run:
+            log.info("MOVE    %s  ->  %s/Team Documents/Meeting Notes/", name, client_name)
+            moved += 1
+            continue
+
+        team_docs_id     = get_or_create_folder(service, "Team Documents", client_folder_id)
+        meeting_notes_id = get_or_create_folder(service, "Meeting Notes", team_docs_id)
+
+        dest_files = list_folder_children(service, meeting_notes_id)
+        source_md5 = file.get("md5Checksum", "")
+
+        if source_md5 and is_duplicate(source_md5, dest_files):
+            log.info("SKIP    %s  (duplicate content)", name)
+            continue
+
+        dest_names = {f["name"] for f in dest_files}
+        dest_name = name
+        if dest_name in dest_names:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            stem, ext = Path(name).stem, Path(name).suffix
+            dest_name = f"{stem} ({ts}){ext}"
+
+        move_file(service, file["id"], source_folder_id, meeting_notes_id, dest_name)
+
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        dest_path = f"{client_name}/Team Documents/Meeting Notes/"
+        log.info("MOVED   %s  ->  %s%s", name, dest_path, dest_name)
+        new_log_rows.append(f"{ts:<20}  {name:<50}  {dest_path}{dest_name}")
+        moved += 1
+
+    if new_log_rows and not dry_run:
+        append_to_drive_log(service, source_folder_id, new_log_rows)
+        log.info("Move Log.txt updated for %s (%d row(s))", owner, len(new_log_rows))
+
+    return moved
+
+
+# ── Main run ──────────────────────────────────────────────────────────────────
 
 def run(config: dict) -> None:
     clients_folder_id: str = config["CLIENTS_FOLDER_ID"]
     dry_run: bool = config.get("DRY_RUN", False)
 
-    service = get_service()
+    service  = get_service()
+    state    = load_state()
 
-    # ── Find all shared 'Read AI Meeting Notes' folders ──────────────────────
-    source_folders = list_files(
-        service,
-        query=(
-            f"name = '{SOURCE_FOLDER_NAME}' "
-            f"and mimeType = 'application/vnd.google-apps.folder' "
-            f"and sharedWithMe = true "
-            f"and trashed = false"
-        ),
-        fields="files(id, name, owners)",
-    )
-
-    if not source_folders:
-        log.info("No '%s' folders shared with you. Nothing to do.", SOURCE_FOLDER_NAME)
-        return
-
-    # ── Build client name → folder ID map ────────────────────────────────────
+    # ── Build client map ──────────────────────────────────────────────────────
     client_folders = list_files(
         service,
         query=(
@@ -251,91 +343,79 @@ def run(config: dict) -> None:
         log.warning("No client folders found in Clients folder (%s)", clients_folder_id)
         return
 
-    log.info("========================================")
-    log.info("Run started")
-    log.info("Source folders : %d shared '%s' folder(s)", len(source_folders), SOURCE_FOLDER_NAME)
-    log.info("Clients        : %s", ", ".join(sorted(client_map)))
-    if dry_run:
-        log.info("[DRY RUN] No files will be moved.")
+    # ── Find all source folders ───────────────────────────────────────────────
+    source_folders = list_files(
+        service,
+        query=(
+            f"name = '{SOURCE_FOLDER_NAME}' "
+            f"and mimeType = 'application/vnd.google-apps.folder' "
+            f"and sharedWithMe = true "
+            f"and trashed = false"
+        ),
+        fields="files(id, name, owners)",
+    )
+    source_folder_ids = {f["id"]: f for f in source_folders}
 
-    total_moved = total_skipped = 0
+    if not source_folder_ids:
+        log.info("No '%s' folders shared with you.", SOURCE_FOLDER_NAME)
+        save_state({**state, "page_token": get_start_page_token(service)})
+        return
 
-    for source_folder in source_folders:
-        owner = source_folder.get("owners", [{}])[0].get("emailAddress", "unknown")
-        folder_id = source_folder["id"]
-        run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # ── Initialise page token if first run ────────────────────────────────────
+    if not state.get("page_token"):
+        state["page_token"] = get_start_page_token(service)
+        log.info("First run — initialising change token and running full scan.")
+        save_state(state)
 
-        log.info("--- Processing folder from: %s ---", owner)
+    # ── Weekly full scan ──────────────────────────────────────────────────────
+    if is_full_scan_due(state):
+        log.info("=== Weekly full scan ===")
+        total = 0
+        for folder in source_folders:
+            owner     = folder.get("owners", [{}])[0].get("emailAddress", "unknown")
+            folder_id = folder["id"]
+            log.info("Scanning folder from: %s", owner)
+            docx_files = [
+                f for f in list_folder_children(service, folder_id)
+                if f["name"].endswith(".docx")
+            ]
+            moved = process_files(service, docx_files, folder_id, owner, client_map, dry_run)
+            total += moved
+        log.info("Weekly scan done. Total moved: %d", total)
+        state["last_full_scan"] = datetime.now(timezone.utc).isoformat()
+        state["page_token"] = get_start_page_token(service)
+        save_state(state)
+        return
 
-        docx_files = [
-            f for f in list_folder_children(service, folder_id)
-            if f["name"].endswith(".docx")
-        ]
+    # ── Change detection ──────────────────────────────────────────────────────
+    changed_files, new_page_token = get_changed_files(service, state["page_token"])
 
-        # Rows to append to Move Log.txt — only actual moves, no noise
-        new_log_rows: list[str] = []
-
-        if not docx_files:
-            log.info("No .docx files found.")
+    # Filter: only .docx files that live in one of our source folders
+    files_by_folder: dict[str, list] = {}
+    for f in changed_files:
+        if not f["name"].endswith(".docx"):
             continue
+        for parent_id in f.get("parents", []):
+            if parent_id in source_folder_ids:
+                files_by_folder.setdefault(parent_id, []).append(f)
+                break
 
-        moved = skipped = 0
+    if not files_by_folder:
+        state["page_token"] = new_page_token
+        save_state(state)
+        return  # nothing new — silent exit
 
-        for file in sorted(docx_files, key=lambda f: f["name"]):
-            name = file["name"]
-            topic = extract_topic(Path(name).stem)
-            client_name, client_folder_id = find_client_match(topic, client_map)
+    log.info("=== New file(s) detected ===")
+    total = 0
+    for folder_id, files in files_by_folder.items():
+        folder = source_folder_ids[folder_id]
+        owner  = folder.get("owners", [{}])[0].get("emailAddress", "unknown")
+        log.info("Processing %d new file(s) from: %s", len(files), owner)
+        total += process_files(service, files, folder_id, owner, client_map, dry_run)
 
-            if client_name is None:
-                log.info("SKIP    %s  (no client match)", name)
-                skipped += 1
-                continue
-
-            if dry_run:
-                log.info("MOVE    %s  ->  %s/Team Documents/Meeting Notes/", name, client_name)
-                moved += 1
-                continue
-
-            # Ensure Team Documents/Meeting Notes/ exists
-            team_docs_id     = get_or_create_folder(service, "Team Documents", client_folder_id)
-            meeting_notes_id = get_or_create_folder(service, "Meeting Notes", team_docs_id)
-
-            # Duplicate check via Drive MD5 — no download needed
-            dest_files = list_folder_children(service, meeting_notes_id)
-            source_md5 = file.get("md5Checksum", "")
-
-            if source_md5 and is_duplicate(source_md5, dest_files):
-                log.info("SKIP    %s  (duplicate content in destination)", name)
-                skipped += 1
-                continue
-
-            # Resolve filename collision (same name, different content)
-            dest_names = {f["name"] for f in dest_files}
-            dest_name = name
-            if dest_name in dest_names:
-                ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-                stem, ext = Path(name).stem, Path(name).suffix
-                dest_name = f"{stem} ({ts}){ext}"
-
-            move_file(service, file["id"], folder_id, meeting_notes_id, dest_name)
-
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-            dest_path = f"{client_name}/Team Documents/Meeting Notes/"
-            log.info("MOVED   %s  ->  %s%s", name, dest_path, dest_name)
-            new_log_rows.append(f"{ts:<20}  {name:<50}  {dest_path}{dest_name}")
-            moved += 1
-
-        log.info("Done. Moved: %d  |  Skipped: %d", moved, skipped)
-        total_moved += moved
-        total_skipped += skipped
-
-        # Only write to Drive log if files were actually moved
-        if new_log_rows and not dry_run:
-            append_to_drive_log(service, folder_id, new_log_rows)
-            log.info("Move Log.txt updated in %s's folder (%d row(s))", owner, len(new_log_rows))
-
-    log.info("========================================")
-    log.info("Total — Moved: %d  |  Skipped: %d", total_moved, total_skipped)
+    log.info("Done. Moved: %d", total)
+    state["page_token"] = new_page_token
+    save_state(state)
 
 
 def main():
