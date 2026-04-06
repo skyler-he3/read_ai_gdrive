@@ -1,0 +1,11 @@
+## [2026-04-06]
+- Initial release
+- Auto-move .docx meeting notes from shared 'Read AI Meeting Notes' folders to correct client subfolder
+- Matches client name from filename (YYYY-MM-DD - <topic with client name>.docx)
+- Creates Team Documents/Meeting Notes/ folder automatically if missing
+- Skips duplicates using Google Drive MD5 checksum (no file download needed)
+- Handles filename collisions by appending timestamp
+- Writes Move Log.txt back into each teammate's Drive folder after every run
+- Runs every 5 minutes via macOS launchd
+- One-command setup via setup.sh
+- Admin-controlled: teammates only need to share their folder, no installs required
